@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+requests
+imageio[ffmpeg]
+Pillow
