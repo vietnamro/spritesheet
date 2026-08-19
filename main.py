@@ -3,7 +3,9 @@ import os
 import time
 import json
 import uuid
+import math
 import random
+import hashlib
 import threading
 
 import requests
@@ -28,6 +30,16 @@ FRAMES = 120
 FPS = 30
 WIDTH = 768
 HEIGHT = 512
+
+GRID_COLS = 4
+GRID_ROWS = 6
+CELL_W = 256
+CELL_H = 170
+PER_SHEET = GRID_COLS * GRID_ROWS
+SHEET_COUNT = int(math.ceil(FRAMES / PER_SHEET))
+
+SHEET_CACHE = {}
+SHEET_CACHE_LOCK = threading.Lock()
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
@@ -174,51 +186,84 @@ def run_job(job, prompt):
             JOBS[job] = {"status": "error", "error": str(exc)[:400], "_ts": time.time()}
 
 
-def split_video_to_grid(video_url, frames=120, cols=9, cellW=108, cellH=72):
+def sample_indices(total, frames):
+    if total <= frames:
+        return list(range(total))
+    out = []
+    for i in range(frames):
+        out.append(int(i * (total - 1) / max(frames - 1, 1)))
+    return out
+
+
+def get_video_cache(video_url):
+    key = hashlib.md5(video_url.encode()).hexdigest()
+    with SHEET_CACHE_LOCK:
+        ent = SHEET_CACHE.get(key)
+        if ent and os.path.exists(ent["path"]) and time.time() - ent["ts"] < 900:
+            return ent
     r = requests.get(video_url, timeout=120, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
-    tmp_path = "/tmp/" + uuid.uuid4().hex + ".mp4"
+    tmp_path = "/tmp/" + key + ".mp4"
     with open(tmp_path, "wb") as f:
         f.write(r.content)
     reader = imageio.get_reader(tmp_path)
-    total = reader.count_frames()
-    indices = []
-    if total <= frames:
-        indices = list(range(total))
-    else:
-        for i in range(frames):
-            indices.append(int(i * (total - 1) / max(frames - 1, 1)))
-    rows = (len(indices) + cols - 1) // cols
-    sheet = Image.new("RGB", (cols * cellW, rows * cellH), (0, 0, 0))
-    for k, idx in enumerate(indices):
-        frame = reader.get_data(idx)
-        im = Image.fromarray(frame).convert("RGB").resize((cellW, cellH), Image.Resampling.LANCZOS)
-        r_, c_ = divmod(k, cols)
-        sheet.paste(im, (c_ * cellW, r_ * cellH))
+    try:
+        total = reader.count_frames()
+    finally:
+        try:
+            reader.close()
+        except Exception:
+            pass
+    indices = sample_indices(total, FRAMES)
+    ent = {"path": tmp_path, "indices": indices, "ts": time.time()}
+    with SHEET_CACHE_LOCK:
+        SHEET_CACHE[key] = ent
+    return ent
+
+
+def split_video_to_grid(video_url, sheet=1):
+    ent = get_video_cache(video_url)
+    reader = imageio.get_reader(ent["path"])
+    sheet_img = Image.new("RGB", (GRID_COLS * CELL_W, GRID_ROWS * CELL_H), (0, 0, 0))
+    start = (sheet - 1) * PER_SHEET
+    for k in range(PER_SHEET):
+        idx = start + k
+        if idx >= len(ent["indices"]):
+            break
+        frame = reader.get_data(ent["indices"][idx])
+        im = Image.fromarray(frame).convert("RGB").resize((CELL_W, CELL_H), Image.Resampling.LANCZOS)
+        r_, c_ = divmod(k, GRID_COLS)
+        sheet_img.paste(im, (c_ * CELL_W, r_ * CELL_H))
     try:
         reader.close()
     except Exception:
         pass
-    try:
-        os.unlink(tmp_path)
-    except Exception:
-        pass
     buf = io.BytesIO()
-    sheet.save(buf, format="JPEG", quality=95)
-    return buf.getvalue(), cols, rows, len(indices), cellW, cellH
+    sheet_img.save(buf, format="JPEG", quality=95)
+    return buf.getvalue()
 
 
 @app.get("/convert")
-def convert(video_url: str = ""):
+def convert(video_url: str = "", sheet: int = 1):
     if not video_url:
         return JSONResponse({"error": "video_url required"}, status_code=400)
+    if sheet < 1:
+        sheet = 1
     try:
-        data, cols, rows, count, cellW, cellH = split_video_to_grid(video_url)
+        data = split_video_to_grid(video_url, sheet)
     except Exception as exc:
         return JSONResponse({"error": str(exc)[:200]}, status_code=400)
     from fastapi.responses import Response
 
-    return Response(content=data, media_type="image/jpeg", headers={"X-Cols": str(cols), "X-Rows": str(rows), "X-Frames": str(count), "X-CellW": str(cellW), "X-CellH": str(cellH)})
+    return Response(content=data, media_type="image/jpeg", headers={
+        "X-Cols": str(GRID_COLS),
+        "X-Rows": str(GRID_ROWS),
+        "X-CellW": str(CELL_W),
+        "X-CellH": str(CELL_H),
+        "X-Frames": str(FRAMES),
+        "X-Sheets": str(SHEET_COUNT),
+        "X-Sheet": str(sheet),
+    })
 
 
 @app.get("/generate")
