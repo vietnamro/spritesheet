@@ -43,13 +43,18 @@ SHEET_CACHE_LOCK = threading.Lock()
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
+QUEUE = []
+QUEUE_LOCK = threading.Lock()
+WORKER_ALIVE = True
+INTER_JOB_DELAY = 3
 
 
 def cleanup_jobs():
     now = time.time()
     with JOBS_LOCK:
         for key in list(JOBS.keys()):
-            if now - JOBS[key].get("_ts", 0) > 900:
+            st = JOBS[key]
+            if st.get("status") in ("done", "error") and now - st.get("_ts", 0) > 1800:
                 del JOBS[key]
 
 
@@ -169,47 +174,57 @@ def upload_frame_to_roblox(pil_frame, name):
     raise Exception("upload timeout")
 
 
-def run_job(job, prompt):
-    try:
+def refresh_positions():
+    with QUEUE_LOCK:
+        order = list(QUEUE)
+    with JOBS_LOCK:
+        for i, jid in enumerate(order):
+            job = JOBS.get(jid)
+            if job:
+                job["position"] = i
+
+
+def worker():
+    while WORKER_ALIVE:
+        jid = None
+        with QUEUE_LOCK:
+            if QUEUE:
+                jid = QUEUE.pop(0)
+        if not jid:
+            time.sleep(1)
+            continue
         with JOBS_LOCK:
-            JOBS[job] = {"status": "processing", "done": 0, "total": FRAMES, "_ts": time.time()}
-        video_url = deapi_generate_video(prompt)
-        with JOBS_LOCK:
-            JOBS[job]["done"] = 0
-        r = requests.get(video_url, timeout=120, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        tmp_path = "/tmp/" + job + ".mp4"
-        with open(tmp_path, "wb") as f:
-            f.write(r.content)
-        reader = imageio.get_reader(tmp_path)
-        total = reader.count_frames()
-        indices = []
-        if total <= FRAMES:
-            indices = list(range(total))
-        else:
-            for i in range(FRAMES):
-                indices.append(int(i * (total - 1) / max(FRAMES - 1, 1)))
-        frames = []
-        for k, idx in enumerate(indices):
-            frame = reader.get_data(idx)
-            im = Image.fromarray(frame).convert("RGB")
-            asset_id = upload_frame_to_roblox(im, "SydecVideoFrame" + str(k))
-            frames.append("rbxassetid://" + asset_id)
+            job = JOBS.get(jid)
+            if not job:
+                refresh_positions()
+                continue
+            job["status"] = "processing"
+            job["position"] = 0
+        refresh_positions()
+        try:
+            mp4 = deapi_generate_video(job["prompt"])
+            ent = get_video_cache(mp4)
+            total = len(ent["indices"])
+            sheets = int(math.ceil(total / PER_SHEET)) if PER_SHEET else 1
             with JOBS_LOCK:
-                JOBS[job] = {"status": "processing", "done": k + 1, "total": len(indices), "_ts": time.time()}
-        try:
-            reader.close()
-        except Exception:
-            pass
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
-        with JOBS_LOCK:
-            JOBS[job] = {"status": "done", "frames": frames, "_ts": time.time()}
-    except Exception as exc:
-        with JOBS_LOCK:
-            JOBS[job] = {"status": "error", "error": str(exc)[:400], "_ts": time.time()}
+                job.update({
+                    "status": "done",
+                    "mp4": mp4,
+                    "frames": total,
+                    "sheets": sheets,
+                    "cols": GRID_COLS,
+                    "rows": GRID_ROWS,
+                    "cellW": CELL_W,
+                    "cellH": CELL_H,
+                    "_ts": time.time(),
+                })
+        except Exception as exc:
+            with JOBS_LOCK:
+                job["status"] = "error"
+                job["error"] = str(exc)[:400]
+                job["_ts"] = time.time()
+        refresh_positions()
+        time.sleep(INTER_JOB_DELAY)
 
 
 def sample_indices(total, frames):
@@ -301,8 +316,13 @@ def generate(prompt: str = ""):
     if not prompt or not prompt.strip():
         return JSONResponse({"error": "prompt required"}, status_code=400)
     job = uuid.uuid4().hex
-    threading.Thread(target=run_job, args=(job, prompt), daemon=True).start()
-    return {"job": job}
+    with JOBS_LOCK:
+        JOBS[job] = {"status": "queued", "prompt": prompt, "position": 0, "_ts": time.time()}
+    with QUEUE_LOCK:
+        QUEUE.append(job)
+        position = len(QUEUE) - 1
+    refresh_positions()
+    return {"job": job, "position": position}
 
 
 @app.get("/job")
@@ -313,8 +333,23 @@ def job_status(job: str = ""):
     st = JOBS.get(job)
     if not st:
         return JSONResponse({"error": "not found"}, status_code=404)
-    if st.get("status") == "done":
-        return {"status": "done", "frames": st.get("frames", [])}
-    if st.get("status") == "error":
+    status = st.get("status")
+    if status == "done":
+        return {
+            "status": "done",
+            "mp4": st.get("mp4"),
+            "frames": st.get("frames", FRAMES),
+            "sheets": st.get("sheets", 0),
+            "cols": st.get("cols", GRID_COLS),
+            "rows": st.get("rows", GRID_ROWS),
+            "cellW": st.get("cellW", CELL_W),
+            "cellH": st.get("cellH", CELL_H),
+        }
+    if status == "error":
         return {"status": "error", "error": st.get("error", "failed")}
-    return {"status": "processing", "done": st.get("done", 0), "total": st.get("total", FRAMES)}
+    if status == "queued":
+        return {"status": "queued", "position": st.get("position", 0)}
+    return {"status": "processing", "position": 0}
+
+
+threading.Thread(target=worker, daemon=True).start()
