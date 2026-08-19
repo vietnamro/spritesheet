@@ -26,15 +26,15 @@ ROBLOX_ASSETS_URL = "https://apis.roblox.com/assets/v1/assets"
 ROBLOX_OPERATIONS_URL = "https://apis.roblox.com/assets/v1/operations"
 
 MODEL = "Ltxv_13B_0_9_8_Distilled_FP8"
-FRAMES = 120
+FRAMES = 70
 FPS = 30
 WIDTH = 768
 HEIGHT = 512
 
 GRID_COLS = 4
-GRID_ROWS = 6
-CELL_W = 256
-CELL_H = 170
+GRID_ROWS = 5
+CELL_W = 240
+CELL_H = 160
 PER_SHEET = GRID_COLS * GRID_ROWS
 SHEET_COUNT = int(math.ceil(FRAMES / PER_SHEET))
 
@@ -58,31 +58,52 @@ def home():
     return {"status": "Render Roblox Video API Aktif!"}
 
 
+def _rate_limited(resp):
+    if resp is None:
+        return False
+    if resp.status_code == 429:
+        return True
+    try:
+        text = (resp.text or "").lower()
+    except Exception:
+        return False
+    return ("too many" in text) or ("rate limit" in text) or ("attempt" in text)
+
+
 def deapi_generate_video(prompt):
-    body = {
-        "model": MODEL,
-        "prompt": prompt,
-        "width": WIDTH,
-        "height": HEIGHT,
-        "frames": FRAMES,
-        "fps": FPS,
-        "guidance": 7.5,
-        "steps": 1,
-        "seed": random.randint(1, 2147483647),
-    }
-    r = requests.post(
-        DEAPI_GENERATE_URL,
-        headers={"Authorization": "Bearer " + DEAPI_KEY, "Content-Type": "application/json"},
-        json=body,
-        timeout=60,
-    )
-    if r.status_code not in (200, 201):
-        raise Exception("deapi request failed: " + r.text[:200])
-    data = r.json().get("data", r.json())
-    request_id = data.get("request_id") or data.get("requestId") or data.get("id")
+    request_id = None
+    last_error = "deapi request failed"
+    for attempt in range(1, 5):
+        body = {
+            "model": MODEL,
+            "prompt": prompt,
+            "width": WIDTH,
+            "height": HEIGHT,
+            "frames": FRAMES,
+            "fps": FPS,
+            "guidance": 7.5,
+            "steps": 1,
+            "seed": random.randint(1, 2147483647),
+        }
+        r = requests.post(
+            DEAPI_GENERATE_URL,
+            headers={"Authorization": "Bearer " + DEAPI_KEY, "Content-Type": "application/json"},
+            json=body,
+            timeout=60,
+        )
+        if r.status_code in (200, 201):
+            data = r.json().get("data", r.json())
+            request_id = data.get("request_id") or data.get("requestId") or data.get("id")
+            if request_id:
+                break
+            raise Exception("deapi returned no request id")
+        last_error = "deapi request failed: " + r.text[:200]
+        if attempt < 4:
+            time.sleep(32 + attempt * 10 if _rate_limited(r) else 6)
     if not request_id:
-        raise Exception("deapi returned no request id")
-    for _ in range(60):
+        raise Exception(last_error)
+    rate_waits = 0
+    for _ in range(120):
         time.sleep(3)
         p = requests.get(
             DEAPI_JOB_URL + "/" + request_id,
@@ -90,6 +111,11 @@ def deapi_generate_video(prompt):
             timeout=30,
         )
         if p.status_code != 200:
+            if _rate_limited(p):
+                rate_waits += 1
+                if rate_waits > 24:
+                    raise Exception("deapi rate limited while polling")
+                time.sleep(15)
             continue
         j = p.json().get("data", p.json())
         status = str(j.get("status", "")).lower()
@@ -239,7 +265,7 @@ def split_video_to_grid(video_url, sheet=1):
     except Exception:
         pass
     buf = io.BytesIO()
-    sheet_img.save(buf, format="JPEG", quality=95)
+    sheet_img.save(buf, format="JPEG", quality=90)
     return buf.getvalue()
 
 
@@ -250,18 +276,21 @@ def convert(video_url: str = "", sheet: int = 1):
     if sheet < 1:
         sheet = 1
     try:
+        ent = get_video_cache(video_url)
         data = split_video_to_grid(video_url, sheet)
     except Exception as exc:
         return JSONResponse({"error": str(exc)[:200]}, status_code=400)
     from fastapi.responses import Response
 
+    total = len(ent["indices"])
+    sheets = int(math.ceil(total / PER_SHEET)) if PER_SHEET else 1
     return Response(content=data, media_type="image/jpeg", headers={
         "X-Cols": str(GRID_COLS),
         "X-Rows": str(GRID_ROWS),
         "X-CellW": str(CELL_W),
         "X-CellH": str(CELL_H),
-        "X-Frames": str(FRAMES),
-        "X-Sheets": str(SHEET_COUNT),
+        "X-Frames": str(total),
+        "X-Sheets": str(sheets),
         "X-Sheet": str(sheet),
     })
 
