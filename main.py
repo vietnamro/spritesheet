@@ -20,21 +20,30 @@ DEAPI_KEY = "16784|XHKP9SURzRg4Vjr3S5RxRiSmkGNreoNwyKv2Ja4gd2fc14b4"
 DEAPI_GENERATE_URL = "https://api.deapi.ai/api/v2/videos/generations"
 DEAPI_JOB_URL = "https://api.deapi.ai/api/v2/jobs"
 
+VIDEO_KEYS = [
+    os.environ.get("DEAPI_VIDEO_KEY", "16784|XHKP9SURzRg4Vjr3S5RxRiSmkGNreoNwyKv2Ja4gd2fc14b4"),
+    os.environ.get("DEAPI_VIDEO_KEY_2", "16780|9zdlANbmyo2V9F7R8XF5Eiau9rtdvtIQT3Yi1tcE4382c265"),
+    os.environ.get("DEAPI_VIDEO_KEY_3", "13714|e1j05Nl7OuZAnBY59lCcRHO4jbN21OE12YGxi6Jze5f610c7"),
+    os.environ.get("DEAPI_VIDEO_KEY_4", "13713|1zj50CKnjvZOHKk09UJWpsihXUie1qlanRQtrqrId828d27c"),
+]
+KEY_CURSOR = [0]
+KEYS_LOCK = threading.Lock()
+
 ROBLOX_API_KEY = "0yHiwJwAAUKKcwqk4y3AowUCo6XmiSHr6uSGyie+N1G1lSzbZXlKaGJHY2lPaUpTVXpJMU5pSXNJbXRwWkNJNkluTnBaeTB5TURJeExUQTNMVEV6VkRFNE9qVXhPalE1V2lJc0luUjVjQ0k2SWtwWFZDSjkuZXlKaGRXUWlPaUpTYjJKc2IzaEpiblJsY201aGJDSXNJbWx6Y3lJNklrTnNiM1ZrUVhWMGFHVnVkR2xqWVhScGIyNVRaWEoyYVdObElpd2lZbUZ6WlVGd2FVdGxlU0k2SWpCNVNHbDNTbmRCUVZWTFMyTjNjV3MwZVROQmIzZFZRMjgyV0cxcFUwaHlOblZUUjNscFpTdE9NVWN4YkZONllpSXNJbTkzYm1WeVNXUWlPaUl4TURReE56QTJOVEl4TXlJc0ltVjRjQ0k2TVRjNE56RTFNakl4TUN3aWFXRjBJam94TnpnM01UUTROakV3TENKdVltWWlPakUzT0RjeE5EZzJNVEI5Lm5CSmlJNWhDSUc1RDJpZzVheUFkQzR5NFdHR3l1a1hfOVV0dDJQamc0Sl8xQmF5ODdObjJvZjRLWTgyY3hFX1dURi1HSllKZThaSFI4M2ZYVl9GLXQ0QmtxdXU1T09LZmlJaUVVOEV6NWUwSUlRc1V0amtQUm15LVdLTE5yYlozMnliNzlEQ3NCZ0l3MWdDSTBrQTJleERjbHFUaEx6aTd4STNHcWd0aERIajdydWlISm5jS0pTaDBCUVQ4RVZmWlV2ZmRiTzhNWUpBOFdQOVRUVXhUY29aQkFNSGRsZFVkajBsc1VMbXVGOTFBOVpCRkhaRjhQSjQ3NjhZREJidEZBRS14dnBuZkdmSUtuMjh2Ykp4ZExkT3hXRExMa1N1RkdxWXhEa3QxeU5YYXptRGRJY3lEOEx2ZWVZUjVyMmNQSzRCYm1ZQWxjV0N3MjY0QzV5M0JBQQ=="
 ROBLOX_OWNER_ID = "10417065213"
 ROBLOX_ASSETS_URL = "https://apis.roblox.com/assets/v1/assets"
 ROBLOX_OPERATIONS_URL = "https://apis.roblox.com/assets/v1/operations"
 
 MODEL = "Ltxv_13B_0_9_8_Distilled_FP8"
-FRAMES = 70
+FRAMES = 120
 FPS = 30
 WIDTH = 768
 HEIGHT = 512
 
 GRID_COLS = 4
-GRID_ROWS = 5
-CELL_W = 240
-CELL_H = 160
+GRID_ROWS = 6
+CELL_W = 256
+CELL_H = 170
 PER_SHEET = GRID_COLS * GRID_ROWS
 SHEET_COUNT = int(math.ceil(FRAMES / PER_SHEET))
 
@@ -75,10 +84,44 @@ def _rate_limited(resp):
     return ("too many" in text) or ("rate limit" in text) or ("attempt" in text)
 
 
+def _key_error_kind(resp):
+    if resp is None:
+        return "none"
+    if resp.status_code == 429:
+        return "rate"
+    if resp.status_code in (401, 403):
+        return "auth"
+    try:
+        t = (resp.text or "").lower()
+    except Exception:
+        return "none"
+    if "balance" in t or "credit" in t or "insufficient" in t:
+        return "balance"
+    if "too many" in t or "rate limit" in t or "attempt" in t:
+        return "rate"
+    if "invalid" in t or "unauthorized" in t or "forbidden" in t:
+        return "auth"
+    return "none"
+
+
+def _next_key_index():
+    with KEYS_LOCK:
+        idx = KEY_CURSOR[0] % len(VIDEO_KEYS)
+        KEY_CURSOR[0] = (idx + 1) % len(VIDEO_KEYS)
+        return idx
+
+
 def deapi_generate_video(prompt):
+    n = len(VIDEO_KEYS)
+    start = _next_key_index()
     request_id = None
+    used_key = None
     last_error = "deapi request failed"
-    for attempt in range(1, 5):
+    for attempt in range(n * 3):
+        idx = (start + attempt) % n
+        key = VIDEO_KEYS[idx]
+        if not key:
+            continue
         body = {
             "model": MODEL,
             "prompt": prompt,
@@ -90,37 +133,51 @@ def deapi_generate_video(prompt):
             "steps": 1,
             "seed": random.randint(1, 2147483647),
         }
-        r = requests.post(
-            DEAPI_GENERATE_URL,
-            headers={"Authorization": "Bearer " + DEAPI_KEY, "Content-Type": "application/json"},
-            json=body,
-            timeout=60,
-        )
+        try:
+            r = requests.post(
+                DEAPI_GENERATE_URL,
+                headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
+                json=body,
+                timeout=60,
+            )
+        except Exception as exc:
+            last_error = "deapi request failed: " + str(exc)[:120]
+            time.sleep(3)
+            continue
         if r.status_code in (200, 201):
             data = r.json().get("data", r.json())
             request_id = data.get("request_id") or data.get("requestId") or data.get("id")
             if request_id:
+                used_key = key
                 break
             raise Exception("deapi returned no request id")
         last_error = "deapi request failed: " + r.text[:200]
-        if attempt < 4:
-            time.sleep(32 + attempt * 10 if _rate_limited(r) else 6)
-    if not request_id:
+        kind = _key_error_kind(r)
+        if kind in ("balance", "auth"):
+            time.sleep(1)
+        elif kind == "rate":
+            time.sleep(5 + attempt * 2)
+        else:
+            time.sleep(3)
+    if not request_id or not used_key:
         raise Exception(last_error)
     rate_waits = 0
     for _ in range(120):
         time.sleep(3)
         p = requests.get(
             DEAPI_JOB_URL + "/" + request_id,
-            headers={"Authorization": "Bearer " + DEAPI_KEY},
+            headers={"Authorization": "Bearer " + used_key},
             timeout=30,
         )
         if p.status_code != 200:
-            if _rate_limited(p):
+            kind = _key_error_kind(p)
+            if kind == "rate":
                 rate_waits += 1
                 if rate_waits > 24:
                     raise Exception("deapi rate limited while polling")
                 time.sleep(15)
+            elif kind in ("auth", "balance"):
+                raise Exception("deapi key invalidated during polling")
             continue
         j = p.json().get("data", p.json())
         status = str(j.get("status", "")).lower()
@@ -136,7 +193,7 @@ def deapi_generate_video(prompt):
 
 def upload_frame_to_roblox(pil_frame, name):
     buf = io.BytesIO()
-    pil_frame.save(buf, format="JPEG", quality=95)
+    pil_frame.save(buf, format="JPEG", quality=97)
     content = buf.getvalue()
     req = {
         "assetType": "Decal",
@@ -280,7 +337,7 @@ def split_video_to_grid(video_url, sheet=1):
     except Exception:
         pass
     buf = io.BytesIO()
-    sheet_img.save(buf, format="JPEG", quality=90)
+    sheet_img.save(buf, format="JPEG", quality=92)
     return buf.getvalue()
 
 
@@ -335,10 +392,13 @@ def job_status(job: str = ""):
         return JSONResponse({"error": "not found"}, status_code=404)
     status = st.get("status")
     if status == "done":
+        fr = st.get("frames")
+        if isinstance(fr, list) and fr:
+            return {"status": "done", "frames": fr}
         return {
             "status": "done",
             "mp4": st.get("mp4"),
-            "frames": st.get("frames", FRAMES),
+            "frames": [],
             "sheets": st.get("sheets", 0),
             "cols": st.get("cols", GRID_COLS),
             "rows": st.get("rows", GRID_ROWS),
@@ -349,7 +409,57 @@ def job_status(job: str = ""):
         return {"status": "error", "error": st.get("error", "failed")}
     if status == "queued":
         return {"status": "queued", "position": st.get("position", 0)}
-    return {"status": "processing", "position": 0}
+    return {"status": "processing", "done": st.get("done", 0), "total": st.get("total", FRAMES)}
 
 
 threading.Thread(target=worker, daemon=True).start()
+
+
+def run_render_job(job, video_url):
+    try:
+        with JOBS_LOCK:
+            JOBS[job] = {"status": "processing", "done": 0, "total": FRAMES, "_ts": time.time()}
+        r = requests.get(video_url, timeout=180, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        tmp_path = "/tmp/" + job + ".mp4"
+        with open(tmp_path, "wb") as f:
+            f.write(r.content)
+        reader = imageio.get_reader(tmp_path)
+        try:
+            total = reader.count_frames()
+        finally:
+            pass
+        indices = sample_indices(total, FRAMES)
+        frames = []
+        for k, idx in enumerate(indices):
+            frame = reader.get_data(idx)
+            im = Image.fromarray(frame).convert("RGB")
+            asset_id = upload_frame_to_roblox(im, "SydecVideoFrame" + str(k))
+            frames.append("rbxassetid://" + asset_id)
+            with JOBS_LOCK:
+                JOBS[job] = {"status": "processing", "done": k + 1, "total": len(indices), "_ts": time.time()}
+        try:
+            reader.close()
+        except Exception:
+            pass
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        with JOBS_LOCK:
+            JOBS[job] = {"status": "done", "frames": frames, "_ts": time.time()}
+    except Exception as exc:
+        with JOBS_LOCK:
+            JOBS[job] = {"status": "error", "error": str(exc)[:400], "_ts": time.time()}
+
+
+@app.get("/render")
+def render_video(video_url: str = ""):
+    cleanup_jobs()
+    if not video_url:
+        return JSONResponse({"error": "video_url required"}, status_code=400)
+    job = uuid.uuid4().hex
+    threading.Thread(target=run_render_job, args=(job, video_url), daemon=True).start()
+    return {"job": job}
+
+
