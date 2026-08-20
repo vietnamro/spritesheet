@@ -41,9 +41,9 @@ WIDTH = 768
 HEIGHT = 512
 
 GRID_COLS = 4
-GRID_ROWS = 6
-CELL_W = 256
-CELL_H = 170
+GRID_ROWS = 5
+CELL_W = 240
+CELL_H = 160
 PER_SHEET = GRID_COLS * GRID_ROWS
 SHEET_COUNT = int(math.ceil(FRAMES / PER_SHEET))
 
@@ -341,7 +341,7 @@ def split_video_to_grid(video_url, sheet=1):
     except Exception:
         pass
     buf = io.BytesIO()
-    sheet_img.save(buf, format="JPEG", quality=92)
+    sheet_img.save(buf, format="JPEG", quality=90)
     return buf.getvalue()
 
 
