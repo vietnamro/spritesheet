@@ -35,7 +35,7 @@ ROBLOX_ASSETS_URL = "https://apis.roblox.com/assets/v1/assets"
 ROBLOX_OPERATIONS_URL = "https://apis.roblox.com/assets/v1/operations"
 
 MODEL = "Ltxv_13B_0_9_8_Distilled_FP8"
-FRAMES = 120
+FRAMES = 70
 FPS = 30
 WIDTH = 768
 HEIGHT = 512
@@ -214,12 +214,12 @@ def upload_frame_to_roblox(pil_frame, name):
     op_id = body.get("operationId") or str(body.get("path", "")).split("/")[-1]
     if not op_id:
         raise Exception("no operation id")
-    for _ in range(80):
-        time.sleep(0.8)
+    for _ in range(40):
+        time.sleep(0.5)
         rr = requests.get(
             ROBLOX_OPERATIONS_URL + "/" + op_id,
             headers={"x-api-key": ROBLOX_API_KEY},
-            timeout=30,
+            timeout=20,
         )
         if rr.status_code == 200:
             j = rr.json()
@@ -228,6 +228,10 @@ def upload_frame_to_roblox(pil_frame, name):
                 if asset_id:
                     return str(asset_id)
                 raise Exception("upload done without assetId")
+            if j.get("error"):
+                raise Exception("upload error: " + str(j.get("error"))[:120])
+        elif rr.status_code in (401, 403):
+            raise Exception("roblox key rejected (HTTP %d)" % rr.status_code)
     raise Exception("upload timeout")
 
 
@@ -416,11 +420,14 @@ threading.Thread(target=worker, daemon=True).start()
 
 
 def run_render_job(job, video_url):
+    start = time.time()
     try:
         with JOBS_LOCK:
             JOBS[job] = {"status": "processing", "done": 0, "total": FRAMES, "_ts": time.time()}
-        r = requests.get(video_url, timeout=180, headers={"User-Agent": "Mozilla/5.0"})
+        r = requests.get(video_url, timeout=120, headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
+        if time.time() - start > 400:
+            raise Exception("download too slow")
         tmp_path = "/tmp/" + job + ".mp4"
         with open(tmp_path, "wb") as f:
             f.write(r.content)
@@ -432,6 +439,8 @@ def run_render_job(job, video_url):
         indices = sample_indices(total, FRAMES)
         frames = []
         for k, idx in enumerate(indices):
+            if time.time() - start > 420:
+                raise Exception("render job timeout")
             frame = reader.get_data(idx)
             im = Image.fromarray(frame).convert("RGB")
             asset_id = upload_frame_to_roblox(im, "SydecVideoFrame" + str(k))
